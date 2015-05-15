@@ -1829,7 +1829,7 @@ module ts {
         // If we were given a text change range, and our version or open-ness changed, then 
         // incrementally parse this file.
 
-        let tracer: (t: string, f: () => any) => any = trace || ((t, f) => f());
+        let tracer = trace || ((t, f) => f());
 
         if (textChangeRange) {
             if (version !== sourceFile.version) {
@@ -2362,17 +2362,6 @@ module ts {
         let syntaxTreeCache: SyntaxTreeCache = new SyntaxTreeCache(host);
         let ruleProvider: formatting.RulesProvider;
         let program: Program;
-
-        let tracer: Tracer = {
-            log,
-            run(text, f) {
-                log(text);
-                let start = Date.now();
-                let r = f();
-                log(text + " completed " + (Date.now() - start));
-                return r;
-            }
-        }
 
         let lastProjectVersion: string;
         let useCaseSensitivefileNames = false;
@@ -6342,6 +6331,18 @@ module ts {
         }
 
         function getIndentationAtPosition(fileName: string, position: number, editorOptions: EditorOptions) {
+            let buffer = ""
+            let tracer: Tracer = {
+                log,
+                run(text, f) {
+                    buffer += text + "\r\n";
+                    let start = Date.now();
+                    let r = f();
+                    buffer += text + " completed " + (Date.now() - start) + "\r\n";
+                    return r;
+                }
+            }
+
             let start = new Date().getTime();
             let sourceFile = syntaxTreeCache.getCurrentSourceFile(fileName, tracer);
             log("getIndentationAtPosition: getCurrentSourceFile: " + (new Date().getTime() - start));
@@ -6350,7 +6351,7 @@ module ts {
 
             let result = formatting.SmartIndenter.getIndentation(position, sourceFile, editorOptions);
             log("getIndentationAtPosition: computeIndentation  : " + (new Date().getTime() - start));
-
+            log(buffer);
             return result;
         }
 
@@ -6366,7 +6367,7 @@ module ts {
 
 
         function getFormattingEditsAfterKeystroke(fileName: string, position: number, key: string, options: FormatCodeOptions): TextChange[] {
-            let sourceFile = syntaxTreeCache.getCurrentSourceFile(fileName, tracer);
+            let sourceFile = syntaxTreeCache.getCurrentSourceFile(fileName, undefined);
 
             if (key === "}") {
                 return formatting.formatOnClosingCurly(position, sourceFile, getRuleProvider(options), options);
