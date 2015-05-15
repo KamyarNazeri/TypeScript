@@ -335,8 +335,8 @@ module ts {
     // from this SourceFile that are being held onto may change as a result (including
     // becoming detached from any SourceFile).  It is recommended that this SourceFile not
     // be used once 'update' is called on it.
-    export function updateSourceFile(sourceFile: SourceFile, newText: string, textChangeRange: TextChangeRange, aggressiveChecks?: boolean): SourceFile {
-        return IncrementalParser.updateSourceFile(sourceFile, newText, textChangeRange, aggressiveChecks);
+    export function updateSourceFile(sourceFile: SourceFile, newText: string, textChangeRange: TextChangeRange, aggressiveChecks?: boolean, trace? : (t: string, f: () => any) => any): SourceFile {
+        return IncrementalParser.updateSourceFile(sourceFile, newText, textChangeRange, aggressiveChecks, trace);
     }
 
     // Implement the parser as a singleton module.  We do this for perf reasons because creating
@@ -4862,11 +4862,15 @@ module ts {
     }
 
     module IncrementalParser {
-        export function updateSourceFile(sourceFile: SourceFile, newText: string, textChangeRange: TextChangeRange, aggressiveChecks: boolean): SourceFile {
+        export function updateSourceFile(sourceFile: SourceFile, newText: string, textChangeRange: TextChangeRange, aggressiveChecks: boolean, trace: (text: string, f: () => any) => any): SourceFile {
             aggressiveChecks = aggressiveChecks || Debug.shouldAssert(AssertionLevel.Aggressive);
+            trace = trace || (<(text: string, f: () => any) => any>((_, f) => f()));
 
-            checkChangeRange(sourceFile, newText, textChangeRange, aggressiveChecks);
-            if (textChangeRangeIsUnchanged(textChangeRange)) {
+            var isUnchanged = trace("initial check", () => {
+                checkChangeRange(sourceFile, newText, textChangeRange, aggressiveChecks);
+                return textChangeRangeIsUnchanged(textChangeRange);
+            });
+            if (isUnchanged) {
                 // if the text didn't change, then we can just return our current source file as-is.
                 return sourceFile;
             }
@@ -4892,19 +4896,21 @@ module ts {
 
             // Make the actual change larger so that we know to reparse anything whose lookahead
             // might have intersected the change.
-            let changeRange = extendToAffectedRange(sourceFile, textChangeRange);
-            checkChangeRange(sourceFile, newText, changeRange, aggressiveChecks);
+            let changeRange = trace("extendToAffectedRange", () => extendToAffectedRange(sourceFile, textChangeRange));
+            trace("checkChangeRange", () => checkChangeRange(sourceFile, newText, changeRange, aggressiveChecks));
 
             // Ensure that extending the affected range only moved the start of the change range
             // earlier in the file.
-            Debug.assert(changeRange.span.start <= textChangeRange.span.start);
-            Debug.assert(textSpanEnd(changeRange.span) === textSpanEnd(textChangeRange.span));
-            Debug.assert(textSpanEnd(textChangeRangeNewSpan(changeRange)) === textSpanEnd(textChangeRangeNewSpan(textChangeRange)));
-
+            trace("asserts", () => {
+                Debug.assert(changeRange.span.start <= textChangeRange.span.start);
+                Debug.assert(textSpanEnd(changeRange.span) === textSpanEnd(textChangeRange.span));
+                Debug.assert(textSpanEnd(textChangeRangeNewSpan(changeRange)) === textSpanEnd(textChangeRangeNewSpan(textChangeRange)));
+            });
             // The is the amount the nodes after the edit range need to be adjusted.  It can be
             // positive (if the edit added characters), negative (if the edit deleted characters)
             // or zero (if this was a pure overwrite with nothing added/removed).
-            let delta = textChangeRangeNewSpan(changeRange).length - changeRange.span.length;
+            let delta = trace(
+                "delta", () => textChangeRangeNewSpan(changeRange).length - changeRange.span.length);
 
             // If we added or removed characters during the edit, then we need to go and adjust all
             // the nodes after the edit.  Those nodes may move forward (if we inserted chars) or they
@@ -4925,9 +4931,10 @@ module ts {
             //
             // Also, mark any syntax elements that intersect the changed span.  We know, up front,
             // that we cannot reuse these elements.
-            updateTokenPositionsAndMarkElements(incrementalSourceFile,
-                changeRange.span.start, textSpanEnd(changeRange.span), textSpanEnd(textChangeRangeNewSpan(changeRange)), delta, oldText, newText, aggressiveChecks);
-
+            trace("updateTokenPositionsAndMarkElements", () =>
+                updateTokenPositionsAndMarkElements(incrementalSourceFile,
+                    changeRange.span.start, textSpanEnd(changeRange.span), textSpanEnd(textChangeRangeNewSpan(changeRange)), delta, oldText, newText, aggressiveChecks)
+            );
             // Now that we've set up our internal incremental state just proceed and parse the
             // source file in the normal fashion.  When possible the parser will retrieve and
             // reuse nodes from the old tree.
@@ -4938,7 +4945,7 @@ module ts {
             // inconsistent tree.  Setting the parents on the new tree should be very fast.  We
             // will immediately bail out of walking any subtrees when we can see that their parents
             // are already correct.
-            let result = Parser.parseSourceFile(sourceFile.fileName, newText, sourceFile.languageVersion, syntaxCursor, /* setParentNode */ true)
+            let result = trace("Parser.parseSourceFile", () => Parser.parseSourceFile(sourceFile.fileName, newText, sourceFile.languageVersion, syntaxCursor, /* setParentNode */ true));
 
             return result;
         }

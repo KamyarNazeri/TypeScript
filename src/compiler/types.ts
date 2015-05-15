@@ -8,6 +8,11 @@ module ts {
         end: number;
     }
 
+    export interface Tracer {
+        run(text: string, f: () => any): any;
+        log(text: string): void;
+    }
+
     // token > SyntaxKind.Identifer => token is a keyword
     export const enum SyntaxKind {
         Unknown,

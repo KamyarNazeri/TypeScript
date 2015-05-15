@@ -48,6 +48,7 @@ module ts {
 
         /** Returns a JSON-encoded value of the type: string[] */
         getScriptFileNames(): string;
+        getProjectVersion(): string;
         getScriptVersion(fileName: string): string;
         getScriptSnapshot(fileName: string): ScriptSnapshotShim;
         getLocalizedDiagnosticMessages(): string;
@@ -55,7 +56,6 @@ module ts {
         getCurrentDirectory(): string;
         getDefaultLibFileName(options: string): string;
         getNewLine?(): string;
-        getProjectVersion?(): string;
     }
 
     /** Public interface of the the of a config service shim instance.*/
@@ -93,8 +93,8 @@ module ts {
         refresh(throwOnError: boolean): void;
 
         cleanupSemanticCache(): void;
-
         getSyntacticDiagnostics(fileName: string): string;
+        getAllSyntacticDiagnostics(): string;
         getSemanticDiagnostics(fileName: string): string;
         getCompilerOptionsDiagnostics(): string;
 
@@ -261,12 +261,7 @@ module ts {
             this.shimHost.error(s);
         }
 
-        public getProjectVersion(): string {
-            if (!this.shimHost.getProjectVersion) {
-                // shimmed host does not support getProjectVersion
-                return undefined;
-            }
-
+        public getProjectVersion() {
             return this.shimHost.getProjectVersion();
         }
 
@@ -516,6 +511,15 @@ module ts {
                 "getSyntacticDiagnostics('" + fileName + "')",
                 () => {
                     var diagnostics = this.languageService.getSyntacticDiagnostics(fileName);
+                    return this.realizeDiagnostics(diagnostics);
+                });
+        }
+
+        public getAllSyntacticDiagnostics(): string {
+            return this.forwardJSONCall(
+                "getAllSyntacticDiagnostics()",
+                () => {
+                    var diagnostics = this.languageService.getAllSyntacticDiagnostics();
                     return this.realizeDiagnostics(diagnostics);
                 });
         }

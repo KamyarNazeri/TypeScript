@@ -970,6 +970,7 @@ module ts {
         cleanupSemanticCache(): void;
 
         getSyntacticDiagnostics(fileName: string): Diagnostic[];
+        getAllSyntacticDiagnostics?(): Diagnostic[];
         getSemanticDiagnostics(fileName: string): Diagnostic[];
         getCompilerOptionsDiagnostics(): Diagnostic[];
 
@@ -1026,7 +1027,6 @@ module ts {
         getEmitOutput(fileName: string): EmitOutput;
 
         getProgram(): Program;
-
         getSourceFile(fileName: string): SourceFile;
 
         dispose(): void;
@@ -1720,24 +1720,27 @@ module ts {
         constructor(private host: LanguageServiceHost) {
         }
 
-        public getCurrentSourceFile(fileName: string): SourceFile {
-            let scriptSnapshot = this.host.getScriptSnapshot(fileName);
+        public getCurrentSourceFile(fileName: string, tracer?: Tracer): SourceFile {
+            tracer = tracer || { run: (_, f) => f(), log() { } };
+            let scriptSnapshot = tracer.run("getCurrentSourceFile::getScriptSnapshot", () => this.host.getScriptSnapshot(fileName));
             if (!scriptSnapshot) {
                 // The host does not know about this file.
                 throw new Error("Could not find file: '" + fileName + "'.");
             }
 
-            let version = this.host.getScriptVersion(fileName);
+            let version = tracer.run("getCurrentSourceFile::getScriptVersion", () => this.host.getScriptVersion(fileName));
             let sourceFile: SourceFile;
 
             if (this.currentFileName !== fileName) {
                 // This is a new file, just parse it
-                sourceFile = createLanguageServiceSourceFile(fileName, scriptSnapshot, ScriptTarget.Latest, version, /*setNodeParents:*/ true);
+                sourceFile = tracer.run("getCurrentSourceFile::createLanguageServiceSourceFile", () => createLanguageServiceSourceFile(fileName, scriptSnapshot, ScriptTarget.Latest, version, /*setNodeParents:*/ true));
             }
             else if (this.currentFileVersion !== version) {
-                // This is the same file, just a newer version. Incrementally parse the file.
-                let editRange = scriptSnapshot.getChangeRange(this.currentFileScriptSnapshot);
-                sourceFile = updateLanguageServiceSourceFile(this.currentSourceFile, scriptSnapshot, version, editRange);
+                sourceFile = tracer.run("getCurrentSourceFile::updateLanguageServiceSourceFile", () => {
+                    // This is the same file, just a newer version. Incrementally parse the file.
+                    let editRange = scriptSnapshot.getChangeRange(this.currentFileScriptSnapshot);
+                    return updateLanguageServiceSourceFile(this.currentSourceFile, scriptSnapshot, version, editRange, tracer.run, false);
+                });
             }
 
             if (sourceFile) {
@@ -1822,25 +1825,30 @@ module ts {
 
     export let disableIncrementalParsing = false;
 
-    export function updateLanguageServiceSourceFile(sourceFile: SourceFile, scriptSnapshot: IScriptSnapshot, version: string, textChangeRange: TextChangeRange, aggressiveChecks?: boolean): SourceFile {
+    export function updateLanguageServiceSourceFile(sourceFile: SourceFile, scriptSnapshot: IScriptSnapshot, version: string, textChangeRange: TextChangeRange, trace?: (text: string, f: () => any) => any, aggressiveChecks?: boolean): SourceFile {
         // If we were given a text change range, and our version or open-ness changed, then 
         // incrementally parse this file.
+
+        let tracer: (t: string, f: () => any) => any = trace || ((t, f) => f());
+
         if (textChangeRange) {
             if (version !== sourceFile.version) {
                 // Once incremental parsing is ready, then just call into this function.
                 if (!disableIncrementalParsing) {
-                    let newSourceFile = updateSourceFile(sourceFile, scriptSnapshot.getText(0, scriptSnapshot.getLength()), textChangeRange, aggressiveChecks);
-                    setSourceFileFields(newSourceFile, scriptSnapshot, version);
-                    // after incremental parsing nameTable might not be up-to-date
-                    // drop it so it can be lazily recreated later
-                    newSourceFile.nameTable = undefined;
-                    return newSourceFile;
+                    return tracer("updateLanguageServiceSourceFile::updateSourceFile", () => {
+                        let newSourceFile = updateSourceFile(sourceFile, scriptSnapshot.getText(0, scriptSnapshot.getLength()), textChangeRange, aggressiveChecks, trace);
+                        tracer("setSourceFileFields", () => setSourceFileFields(newSourceFile, scriptSnapshot, version));
+                        // after incremental parsing nameTable might not be up-to-date
+                        // drop it so it can be lazily recreated later
+                        newSourceFile.nameTable = undefined;
+                        return newSourceFile;
+                    });
                 }
             }
         }
 
         // Otherwise, just create a new source file.
-        return createLanguageServiceSourceFile(sourceFile.fileName, scriptSnapshot, sourceFile.languageVersion, version, /*setNodeParents:*/ true);
+        return tracer("updateLanguageServiceSourceFile::createLanguageServiceSourceFile", () => createLanguageServiceSourceFile(sourceFile.fileName, scriptSnapshot, sourceFile.languageVersion, version, /*setNodeParents:*/ true));
     }
 
     export function createDocumentRegistry(): DocumentRegistry {
@@ -1917,7 +1925,7 @@ module ts {
                 // return it as is.
                 if (entry.sourceFile.version !== version) {
                     entry.sourceFile = updateLanguageServiceSourceFile(entry.sourceFile, scriptSnapshot, version,
-                        scriptSnapshot.getChangeRange(entry.sourceFile.scriptSnapshot));
+                        scriptSnapshot.getChangeRange(entry.sourceFile.scriptSnapshot), undefined, false);
                 }
             }
 
@@ -2354,8 +2362,19 @@ module ts {
         let syntaxTreeCache: SyntaxTreeCache = new SyntaxTreeCache(host);
         let ruleProvider: formatting.RulesProvider;
         let program: Program;
-        let lastProjectVersion: string;
 
+        let tracer: Tracer = {
+            log,
+            run(text, f) {
+                log(text);
+                let start = Date.now();
+                let r = f();
+                log(text + " completed " + (Date.now() - start));
+                return r;
+            }
+        }
+
+        let lastProjectVersion: string;
         let useCaseSensitivefileNames = false;
         let cancellationToken = new CancellationTokenObject(host.getCancellationToken && host.getCancellationToken());
 
@@ -2393,24 +2412,36 @@ module ts {
             return ruleProvider;
         }
 
-        function synchronizeHostData(): void {
-            // perform fast check if host supports it
-            if (host.getProjectVersion) {
-                let hostProjectVersion = host.getProjectVersion();
-                if (hostProjectVersion) {
-                    if (lastProjectVersion === hostProjectVersion) {
-                        return;
-                    }
+        function traceAndRun<T>(text: string, f: () => T): T {
+            let start = new Date();
+            log(text);
+            let result = f();
+            log(text + " completed " + (new Date().getTime() - start.getTime()));
+            return result;
+        }
 
-                    lastProjectVersion = hostProjectVersion;
+        function onlyRun<T>(_: string, f: () => T): T {
+            return f();
+        }
+
+        function synchronizeHostData(trace?: boolean): void {
+            let currentProjectVersion = host.getProjectVersion && host.getProjectVersion();
+            if (currentProjectVersion) {
+                if (currentProjectVersion === lastProjectVersion) {
+                    return;
                 }
+
+                lastProjectVersion = currentProjectVersion;
             }
 
+            let getOrCreateTime = 0;
+            let tracer = trace ? traceAndRun : onlyRun;
+
             // Get a fresh cache of the host information
-            let hostCache = new HostCache(host, getCanonicalFileName);
+            let hostCache = tracer("new HostCache", () => new HostCache(host, getCanonicalFileName));
 
             // If the program is already up-to-date, we can reuse it
-            if (programUpToDate()) {
+            if (tracer("checking is program up to date", () => programUpToDate())) {
                 return;
             }
 
@@ -2425,42 +2456,50 @@ module ts {
             let changesInCompilationSettingsAffectSyntax = oldSettings && oldSettings.target !== newSettings.target;
 
             // Now create a new compiler
-            let newProgram = createProgram(hostCache.getRootFileNames(), newSettings, {
-                getSourceFile: getOrCreateSourceFile,
-                getCancellationToken: () => cancellationToken,
-                getCanonicalFileName,
-                useCaseSensitiveFileNames: () => useCaseSensitivefileNames,
-                getNewLine: () => host.getNewLine ? host.getNewLine() : "\r\n",
-                getDefaultLibFileName: (options) => host.getDefaultLibFileName(options),
-                writeFile: (fileName, data, writeByteOrderMark) => { },
-                getCurrentDirectory: () => host.getCurrentDirectory()
-            });
+            let newProgram = tracer("creating new program",
+                () => createProgram(hostCache.getRootFileNames(), newSettings, {
+                    getSourceFile: getOrCreateSourceFile,
+                    getCancellationToken: () => cancellationToken,
+                    getCanonicalFileName,
+                    useCaseSensitiveFileNames: () => useCaseSensitivefileNames,
+                    getNewLine: () => host.getNewLine ? host.getNewLine() : "\r\n",
+                    getDefaultLibFileName: (options) => host.getDefaultLibFileName(options),
+                    writeFile: (fileName, data, writeByteOrderMark) => { },
+                    getCurrentDirectory: () => host.getCurrentDirectory()
+                }));
 
             // Release any files we have acquired in the old program but are 
             // not part of the new program.
             if (program) {
                 let oldSourceFiles = program.getSourceFiles();
-                for (let oldSourceFile of oldSourceFiles) {
-                    let fileName = oldSourceFile.fileName;
-                    if (!newProgram.getSourceFile(fileName) || changesInCompilationSettingsAffectSyntax) {
-                        documentRegistry.releaseDocument(fileName, oldSettings);
+                tracer("releasing documents", () => {
+                    for (let oldSourceFile of oldSourceFiles) {
+                        let fileName = oldSourceFile.fileName;
+                        if (!newProgram.getSourceFile(fileName) || changesInCompilationSettingsAffectSyntax) {
+                            documentRegistry.releaseDocument(fileName, oldSettings);
+                        }
                     }
-                }
+                });
             }
 
             program = newProgram;
 
             // Make sure all the nodes in the program are both bound, and have their parent 
             // pointers set property.
-            program.getTypeChecker();
+            tracer("get typechecker", () => program.getTypeChecker());
+            if (trace) {
+                log("total time for getOrCreateSourceFile: " + getOrCreateTime);
+            }
             return;
 
             function getOrCreateSourceFile(fileName: string): SourceFile {
+                let start = new Date().getTime();
                 // The program is asking for this file, check first if the host can locate it.
                 // If the host can not locate the file, then it does not exist. return undefined
                 // to the program to allow reporting of errors for missing files.
                 let hostFileInformation = hostCache.getOrCreateEntry(fileName);
                 if (!hostFileInformation) {
+                    getOrCreateTime += (new Date().getTime() - start);
                     return undefined;
                 }
 
@@ -2492,14 +2531,18 @@ module ts {
                         // it's source file any more, and instead defers to DocumentRegistry to get
                         // either version 1, version 2 (or some other version) depending on what the 
                         // host says should be used.
-                        return documentRegistry.updateDocument(fileName, newSettings, hostFileInformation.scriptSnapshot, hostFileInformation.version);
+                        let x = documentRegistry.updateDocument(fileName, newSettings, hostFileInformation.scriptSnapshot, hostFileInformation.version);
+                        getOrCreateTime += (new Date().getTime() - start);
+                        return x;
                     }
 
                     // We didn't already have the file.  Fall through and acquire it from the registry.
                 }
 
                 // Could not find this file in the old program, create a new SourceFile for it.
-                return documentRegistry.acquireDocument(fileName, newSettings, hostFileInformation.scriptSnapshot, hostFileInformation.version);
+                let x = documentRegistry.acquireDocument(fileName, newSettings, hostFileInformation.scriptSnapshot, hostFileInformation.version);
+                getOrCreateTime += (new Date().getTime() - start);
+                return x;
             }
 
             function sourceFileUpToDate(sourceFile: SourceFile): boolean {
@@ -2552,6 +2595,12 @@ module ts {
             synchronizeHostData();
 
             return program.getSyntacticDiagnostics(getValidSourceFile(fileName));
+        }
+
+        function getAllSyntacticDiagnostics(): Diagnostic[] {
+            synchronizeHostData();
+
+            return program.getSyntacticDiagnostics();
         }
 
         /**
@@ -3039,47 +3088,46 @@ module ts {
                     let containingNodeKind = previousToken.parent.kind;
                     switch (previousToken.kind) {
                         case SyntaxKind.CommaToken:
-                            return containingNodeKind === SyntaxKind.CallExpression               // func( a, |
-                                || containingNodeKind === SyntaxKind.Constructor                  // constructor( a, |   public, protected, private keywords are allowed here, so show completion
-                                || containingNodeKind === SyntaxKind.NewExpression                // new C(a, |
-                                || containingNodeKind === SyntaxKind.ArrayLiteralExpression       // [a, |
-                                || containingNodeKind === SyntaxKind.BinaryExpression             // let x = (a, |
-                                || containingNodeKind === SyntaxKind.FunctionType;                // var x: (s: string, list|
+                            return containingNodeKind === SyntaxKind.CallExpression                         // func( a, |
+                                || containingNodeKind === SyntaxKind.Constructor                            // constructor( a, |   public, protected, private keywords are allowed here, so show completion
+                                || containingNodeKind === SyntaxKind.NewExpression                          // new C(a, |
+                                || containingNodeKind === SyntaxKind.ArrayLiteralExpression                 // [a, |
+                                || containingNodeKind === SyntaxKind.BinaryExpression;                      // let x = (a, |
 
+              
                         case SyntaxKind.OpenParenToken:
                             return containingNodeKind === SyntaxKind.CallExpression               // func( |
                                 || containingNodeKind === SyntaxKind.Constructor                  // constructor( |
                                 || containingNodeKind === SyntaxKind.NewExpression                // new C(a|
-                                || containingNodeKind === SyntaxKind.ParenthesizedExpression      // let x = (a|
-                                || containingNodeKind === SyntaxKind.ParenthesizedType;           // function F(pred: (a| this can become an arrow function, where 'a' is the argument
+                                || containingNodeKind === SyntaxKind.ParenthesizedExpression;     // let x = (a|
 
                         case SyntaxKind.OpenBracketToken:
-                            return containingNodeKind === SyntaxKind.ArrayLiteralExpression;      // [ |
+                            return containingNodeKind === SyntaxKind.ArrayLiteralExpression;                 // [ |
 
-                        case SyntaxKind.ModuleKeyword:                                            // module |
-                        case SyntaxKind.NamespaceKeyword:                                         // namespace |
+                        case SyntaxKind.ModuleKeyword:                               // module |
+                        case SyntaxKind.NamespaceKeyword:                            // namespace |
                             return true;
 
                         case SyntaxKind.DotToken:
-                            return containingNodeKind === SyntaxKind.ModuleDeclaration;           // module A.|
+                            return containingNodeKind === SyntaxKind.ModuleDeclaration; // module A.|
 
                         case SyntaxKind.OpenBraceToken:
-                            return containingNodeKind === SyntaxKind.ClassDeclaration;            // class A{ |
+                            return containingNodeKind === SyntaxKind.ClassDeclaration;  // class A{ |
 
                         case SyntaxKind.EqualsToken:
-                            return containingNodeKind === SyntaxKind.VariableDeclaration          // let x = a|
-                                || containingNodeKind === SyntaxKind.BinaryExpression;            // x = a|
+                            return containingNodeKind === SyntaxKind.VariableDeclaration // let x = a|
+                                || containingNodeKind === SyntaxKind.BinaryExpression;   // x = a|
 
                         case SyntaxKind.TemplateHead:
-                            return containingNodeKind === SyntaxKind.TemplateExpression;          // `aa ${|
+                            return containingNodeKind === SyntaxKind.TemplateExpression; // `aa ${|
 
                         case SyntaxKind.TemplateMiddle:
-                            return containingNodeKind === SyntaxKind.TemplateSpan;                // `aa ${10} dd ${|
+                            return containingNodeKind === SyntaxKind.TemplateSpan; // `aa ${10} dd ${|
 
                         case SyntaxKind.PublicKeyword:
                         case SyntaxKind.PrivateKeyword:
                         case SyntaxKind.ProtectedKeyword:
-                            return containingNodeKind === SyntaxKind.PropertyDeclaration;         // class A{ public |
+                            return containingNodeKind === SyntaxKind.PropertyDeclaration; // class A{ public |
                     }
 
                     // Previous token may have been a keyword that was converted to an identifier.
@@ -3158,43 +3206,40 @@ module ts {
                             return containingNodeKind === SyntaxKind.VariableDeclaration ||
                                 containingNodeKind === SyntaxKind.VariableDeclarationList ||
                                 containingNodeKind === SyntaxKind.VariableStatement ||
-                                containingNodeKind === SyntaxKind.EnumDeclaration ||                        // enum a { foo, |
+                                containingNodeKind === SyntaxKind.EnumDeclaration ||           // enum a { foo, |
                                 isFunction(containingNodeKind) ||
-                                containingNodeKind === SyntaxKind.ClassDeclaration ||                       // class A<T, |
-                                containingNodeKind === SyntaxKind.FunctionDeclaration ||                    // function A<T, |
-                                containingNodeKind === SyntaxKind.InterfaceDeclaration ||                   // interface A<T, |
-                                containingNodeKind === SyntaxKind.ArrayBindingPattern ||                    // var [x, y|
-                                containingNodeKind === SyntaxKind.ObjectBindingPattern;                     // function func({ x, y|
-                                                                                                          
+                                containingNodeKind === SyntaxKind.ClassDeclaration ||          // class A<T, |
+                                containingNodeKind === SyntaxKind.FunctionDeclaration ||       // function A<T, |
+                                containingNodeKind === SyntaxKind.InterfaceDeclaration ||      // interface A<T, |
+                                containingNodeKind === SyntaxKind.ArrayBindingPattern ||       //  var [x, y|
+                                containingNodeKind === SyntaxKind.ObjectBindingPattern;        // function func({ x, y|
+
                         case SyntaxKind.DotToken:
-                            return containingNodeKind === SyntaxKind.ArrayBindingPattern;                   // var [.|
-                                                                                                          
-                        case SyntaxKind.ColonToken:
-                            return containingNodeKind === SyntaxKind.BindingElement;                        // var {x :html|
-                                                                                                          
+                            return containingNodeKind === SyntaxKind.ArrayBindingPattern;       // var [.|
+
                         case SyntaxKind.OpenBracketToken:
-                            return containingNodeKind === SyntaxKind.ArrayBindingPattern;                   // var [x|
-                                                                                                          
+                            return containingNodeKind === SyntaxKind.ArrayBindingPattern;         //  var [x|
+
                         case SyntaxKind.OpenParenToken:
                             return containingNodeKind === SyntaxKind.CatchClause ||
                                 isFunction(containingNodeKind);
 
                         case SyntaxKind.OpenBraceToken:
-                            return containingNodeKind === SyntaxKind.EnumDeclaration ||                     // enum a { |
-                                containingNodeKind === SyntaxKind.InterfaceDeclaration ||                   // interface a { |
-                                containingNodeKind === SyntaxKind.TypeLiteral ||                            // let x : { |
-                                containingNodeKind === SyntaxKind.ObjectBindingPattern;                     // function func({ x|
+                            return containingNodeKind === SyntaxKind.EnumDeclaration ||        // enum a { |
+                                containingNodeKind === SyntaxKind.InterfaceDeclaration ||      // interface a { |
+                                containingNodeKind === SyntaxKind.TypeLiteral ||               // let x : { |
+                                containingNodeKind === SyntaxKind.ObjectBindingPattern;        // function func({ x|
 
                         case SyntaxKind.SemicolonToken:
                             return containingNodeKind === SyntaxKind.PropertySignature &&
                                 previousToken.parent && previousToken.parent.parent &&
                                 (previousToken.parent.parent.kind === SyntaxKind.InterfaceDeclaration ||    // interface a { f; |
-                                    previousToken.parent.parent.kind === SyntaxKind.TypeLiteral);           // let x : { a; |
+                                    previousToken.parent.parent.kind === SyntaxKind.TypeLiteral);           //  let x : { a; |
 
                         case SyntaxKind.LessThanToken:
-                            return containingNodeKind === SyntaxKind.ClassDeclaration ||                    // class A< |
-                                containingNodeKind === SyntaxKind.FunctionDeclaration ||                    // function A< |
-                                containingNodeKind === SyntaxKind.InterfaceDeclaration ||                   // interface A< |
+                            return containingNodeKind === SyntaxKind.ClassDeclaration ||        // class A< |
+                                containingNodeKind === SyntaxKind.FunctionDeclaration ||        // function A< |
+                                containingNodeKind === SyntaxKind.InterfaceDeclaration ||       // interface A< |
                                 isFunction(containingNodeKind);
 
                         case SyntaxKind.StaticKeyword:
@@ -3204,7 +3249,7 @@ module ts {
                             return containingNodeKind === SyntaxKind.Parameter ||
                                 containingNodeKind === SyntaxKind.Constructor ||
                                 (previousToken.parent && previousToken.parent.parent &&
-                                    previousToken.parent.parent.kind === SyntaxKind.ArrayBindingPattern);  // var [...z|
+                                    previousToken.parent.parent.kind === SyntaxKind.ArrayBindingPattern);  // var [ ...z|
 
                         case SyntaxKind.PublicKeyword:
                         case SyntaxKind.PrivateKeyword:
@@ -3222,7 +3267,6 @@ module ts {
                         case SyntaxKind.LetKeyword:
                         case SyntaxKind.ConstKeyword:
                         case SyntaxKind.YieldKeyword:
-                        case SyntaxKind.TypeKeyword:  // type htm|
                             return true;
                     }
 
@@ -3308,7 +3352,7 @@ module ts {
         }
 
         function getCompletionsAtPosition(fileName: string, position: number): CompletionInfo {
-            synchronizeHostData();
+            synchronizeHostData(/*trace*/ true);
 
             let completionData = getCompletionData(fileName, position);
             if (!completionData) {
@@ -6299,7 +6343,7 @@ module ts {
 
         function getIndentationAtPosition(fileName: string, position: number, editorOptions: EditorOptions) {
             let start = new Date().getTime();
-            let sourceFile = syntaxTreeCache.getCurrentSourceFile(fileName);
+            let sourceFile = syntaxTreeCache.getCurrentSourceFile(fileName, tracer);
             log("getIndentationAtPosition: getCurrentSourceFile: " + (new Date().getTime() - start));
 
             start = new Date().getTime();
@@ -6320,8 +6364,9 @@ module ts {
             return formatting.formatDocument(sourceFile, getRuleProvider(options), options);
         }
 
+
         function getFormattingEditsAfterKeystroke(fileName: string, position: number, key: string, options: FormatCodeOptions): TextChange[] {
-            let sourceFile = syntaxTreeCache.getCurrentSourceFile(fileName);
+            let sourceFile = syntaxTreeCache.getCurrentSourceFile(fileName, tracer);
 
             if (key === "}") {
                 return formatting.formatOnClosingCurly(position, sourceFile, getRuleProvider(options), options);
@@ -6546,6 +6591,7 @@ module ts {
             dispose,
             cleanupSemanticCache,
             getSyntacticDiagnostics,
+            getAllSyntacticDiagnostics,
             getSemanticDiagnostics,
             getCompilerOptionsDiagnostics,
             getSyntacticClassifications,

@@ -175,6 +175,7 @@ module Harness.LanguageService {
     class NativeLanguageServiceHost extends LanguageServiceAdapterHost implements ts.LanguageServiceHost { 
         getCompilationSettings(): ts.CompilerOptions { return this.settings; }
         getCancellationToken(): ts.CancellationToken { return this.cancellationToken; }
+        getProjectVersion(): string { return undefined;}
         getCurrentDirectory(): string { return ""; }
         getDefaultLibFileName(): string { return ""; }
         getScriptFileNames(): string[] { return this.getFilenames(); }
@@ -210,6 +211,8 @@ module Harness.LanguageService {
             super(cancellationToken, options);
             this.nativeHost = new NativeLanguageServiceHost(cancellationToken, options);
         }
+
+        getProjectVersion(): string { return this.nativeHost.getProjectVersion(); }
 
         getFilenames(): string[] { return this.nativeHost.getFilenames(); }
         getScriptInfo(fileName: string): ScriptInfo { return this.nativeHost.getScriptInfo(fileName); }
@@ -315,6 +318,7 @@ module Harness.LanguageService {
         getEncodedSemanticClassifications(fileName: string, span: ts.TextSpan): ts.Classifications {
             return unwrapJSONCallResult(this.shim.getEncodedSemanticClassifications(fileName, span.start, span.length));
         }
+
         getCompletionsAtPosition(fileName: string, position: number): ts.CompletionInfo {
             return unwrapJSONCallResult(this.shim.getCompletionsAtPosition(fileName, position));
         }

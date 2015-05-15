@@ -94,6 +94,10 @@ module ts.server {
             return ts.combinePaths(nodeModuleBinDir, ts.getDefaultLibFileName(this.compilationSettings));
         }
 
+        getProjectVersion(): string {
+            return undefined;
+        }
+
         getScriptSnapshot(filename: string): ts.IScriptSnapshot {
             var scriptInfo = this.getScriptInfo(filename);
             if (scriptInfo) {
